@@ -1,115 +1,115 @@
-use bytes::Bytes;
-use flowy_database::ConnectionPool;
-use flowy_document::{
-    errors::{internal_error, FlowyError},
-    DocumentCloudService, DocumentConfig, DocumentDatabase, DocumentManager, DocumentUser,
-};
-use flowy_http_model::ws_data::ClientRevisionWSData;
-use flowy_net::ClientServerConfiguration;
-use flowy_net::{
-    http_server::document::DocumentCloudServiceImpl, local_server::LocalServer, ws::connection::FlowyWebSocketConnect,
-};
-use flowy_revision::{RevisionWebSocket, WSStateReceiver};
-use flowy_user::services::UserSession;
-use futures_core::future::BoxFuture;
-use lib_infra::future::BoxResultFuture;
-use lib_ws::{WSChannel, WSMessageReceiver, WebSocketRawMessage};
-use std::{convert::TryInto, path::Path, sync::Arc};
+use std::sync::{Arc, Weak};
+
+use crate::deps_resolve::CollabSnapshotSql;
+use collab_integrate::collab_builder::AppFlowyCollabBuilder;
+use collab_integrate::CollabKVDB;
+use flowy_database2::DatabaseManager;
+use flowy_document::entities::{DocumentSnapshotData, DocumentSnapshotMeta};
+use flowy_document::manager::{DocumentManager, DocumentSnapshotService, DocumentUserService};
+use flowy_document_pub::cloud::DocumentCloudService;
+use flowy_error::{FlowyError, FlowyResult};
+use flowy_storage_pub::storage::StorageService;
+use flowy_user::services::authenticate_user::AuthenticateUser;
 
 pub struct DocumentDepsResolver();
 impl DocumentDepsResolver {
-    pub fn resolve(
-        local_server: Option<Arc<LocalServer>>,
-        ws_conn: Arc<FlowyWebSocketConnect>,
-        user_session: Arc<UserSession>,
-        server_config: &ClientServerConfiguration,
-        document_config: &DocumentConfig,
-    ) -> Arc<DocumentManager> {
-        let user = Arc::new(BlockUserImpl(user_session.clone()));
-        let rev_web_socket = Arc::new(DocumentRevisionWebSocket(ws_conn.clone()));
-        let cloud_service: Arc<dyn DocumentCloudService> = match local_server {
-            None => Arc::new(DocumentCloudServiceImpl::new(server_config.clone())),
-            Some(local_server) => local_server,
-        };
-        let database = Arc::new(DocumentDatabaseImpl(user_session));
-
-        let manager = Arc::new(DocumentManager::new(
-            cloud_service,
-            user,
-            database,
-            rev_web_socket,
-            document_config.clone(),
-        ));
-        let receiver = Arc::new(DocumentWSMessageReceiverImpl(manager.clone()));
-        ws_conn.add_ws_message_receiver(receiver).unwrap();
-
-        manager
-    }
+  pub fn resolve(
+    authenticate_user: Weak<AuthenticateUser>,
+    _database_manager: &Arc<DatabaseManager>,
+    collab_builder: Arc<AppFlowyCollabBuilder>,
+    cloud_service: Arc<dyn DocumentCloudService>,
+    storage_service: Weak<dyn StorageService>,
+  ) -> Arc<DocumentManager> {
+    let user_service: Arc<dyn DocumentUserService> =
+      Arc::new(DocumentUserImpl(authenticate_user.clone()));
+    let snapshot_service = Arc::new(DocumentSnapshotImpl(authenticate_user));
+    Arc::new(DocumentManager::new(
+      user_service.clone(),
+      collab_builder,
+      cloud_service,
+      storage_service,
+      snapshot_service,
+    ))
+  }
 }
 
-struct BlockUserImpl(Arc<UserSession>);
-impl DocumentUser for BlockUserImpl {
-    fn user_dir(&self) -> Result<String, FlowyError> {
-        let dir = self.0.user_dir().map_err(|e| FlowyError::unauthorized().context(e))?;
+struct DocumentSnapshotImpl(Weak<AuthenticateUser>);
 
-        let doc_dir = format!("{}/document", dir);
-        if !Path::new(&doc_dir).exists() {
-            std::fs::create_dir_all(&doc_dir)?;
-        }
-        Ok(doc_dir)
-    }
-
-    fn user_id(&self) -> Result<String, FlowyError> {
-        self.0.user_id()
-    }
-
-    fn token(&self) -> Result<String, FlowyError> {
-        self.0.token()
-    }
+impl DocumentSnapshotImpl {
+  pub fn get_authenticate_user(&self) -> FlowyResult<Arc<AuthenticateUser>> {
+    self
+      .0
+      .upgrade()
+      .ok_or(FlowyError::internal().with_context("Unexpected error: UserSession is None"))
+  }
 }
 
-struct DocumentDatabaseImpl(Arc<UserSession>);
-impl DocumentDatabase for DocumentDatabaseImpl {
-    fn db_pool(&self) -> Result<Arc<ConnectionPool>, FlowyError> {
-        self.0.db_pool()
-    }
-}
-
-struct DocumentRevisionWebSocket(Arc<FlowyWebSocketConnect>);
-impl RevisionWebSocket for DocumentRevisionWebSocket {
-    fn send(&self, data: ClientRevisionWSData) -> BoxResultFuture<(), FlowyError> {
-        let bytes: Bytes = data.try_into().unwrap();
-        let msg = WebSocketRawMessage {
-            channel: WSChannel::Document,
-            data: bytes.to_vec(),
-        };
-        let ws_conn = self.0.clone();
-        Box::pin(async move {
-            match ws_conn.web_socket().await? {
-                None => {}
-                Some(sender) => {
-                    sender.send(msg).map_err(internal_error)?;
-                }
-            }
-            Ok(())
+impl DocumentSnapshotService for DocumentSnapshotImpl {
+  fn get_document_snapshot_metas(
+    &self,
+    document_id: &str,
+  ) -> FlowyResult<Vec<DocumentSnapshotMeta>> {
+    let authenticate_user = self.get_authenticate_user()?;
+    let uid = authenticate_user.user_id()?;
+    let mut db = authenticate_user.get_sqlite_connection(uid)?;
+    CollabSnapshotSql::get_all_snapshots(document_id, &mut db).map(|rows| {
+      rows
+        .into_iter()
+        .map(|row| DocumentSnapshotMeta {
+          snapshot_id: row.id,
+          object_id: row.object_id,
+          created_at: row.timestamp,
         })
-    }
+        .collect()
+    })
+  }
 
-    fn subscribe_state_changed(&self) -> BoxFuture<WSStateReceiver> {
-        let ws_conn = self.0.clone();
-        Box::pin(async move { ws_conn.subscribe_websocket_state().await })
-    }
+  fn get_document_snapshot(&self, snapshot_id: &str) -> FlowyResult<DocumentSnapshotData> {
+    let authenticate_user = self.get_authenticate_user()?;
+    let uid = authenticate_user.user_id()?;
+    let mut db = authenticate_user.get_sqlite_connection(uid)?;
+    CollabSnapshotSql::get_snapshot(snapshot_id, &mut db)
+      .map(|row| DocumentSnapshotData {
+        object_id: row.id,
+        encoded_v1: row.data,
+      })
+      .ok_or(
+        FlowyError::record_not_found().with_context(format!("Snapshot {} not found", snapshot_id)),
+      )
+  }
 }
 
-struct DocumentWSMessageReceiverImpl(Arc<DocumentManager>);
-impl WSMessageReceiver for DocumentWSMessageReceiverImpl {
-    fn source(&self) -> WSChannel {
-        WSChannel::Document
-    }
-    fn receive_message(&self, msg: WebSocketRawMessage) {
-        let handler = self.0.clone();
-        tokio::spawn(async move {
-            handler.receive_ws_data(Bytes::from(msg.data)).await;
-        });
-    }
+struct DocumentUserImpl(Weak<AuthenticateUser>);
+impl DocumentUserService for DocumentUserImpl {
+  fn user_id(&self) -> Result<i64, FlowyError> {
+    self
+      .0
+      .upgrade()
+      .ok_or(FlowyError::internal().with_context("Unexpected error: UserSession is None"))?
+      .user_id()
+  }
+
+  fn device_id(&self) -> Result<String, FlowyError> {
+    self
+      .0
+      .upgrade()
+      .ok_or(FlowyError::internal().with_context("Unexpected error: UserSession is None"))?
+      .device_id()
+  }
+
+  fn workspace_id(&self) -> Result<String, FlowyError> {
+    self
+      .0
+      .upgrade()
+      .ok_or(FlowyError::internal().with_context("Unexpected error: UserSession is None"))?
+      .workspace_id()
+  }
+
+  fn collab_db(&self, uid: i64) -> Result<Weak<CollabKVDB>, FlowyError> {
+    self
+      .0
+      .upgrade()
+      .ok_or(FlowyError::internal().with_context("Unexpected error: UserSession is None"))?
+      .get_collab_db(uid)
+  }
 }

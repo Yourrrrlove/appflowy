@@ -1,17 +1,17 @@
-[tasks.flowy_clean]
+[tasks.flutter_clean]
 run_task = { name = [
-  "cargo_clean",
+  "rust_lib_clean",
   "rm_macro_build_cache",
   "rm_rust_generated_files",
   "rm_dart_generated_files",
 ] }
 
-[tasks.cargo_clean]
+[tasks.rust_lib_clean]
 script = ["""
     cd rust-lib
     cargo clean -q
 
-    cd ../../shared-lib
+    cd ./build-tool
     cargo clean -q
   """]
 script_runner = "@shell"
@@ -40,13 +40,13 @@ run_task = { name = "remove_files_with_pattern" }
 
 [tasks.rm_shared_lib_generated_protobuf_files]
 private = true
-env = { "rm_proto_path" = "../shared-lib/**/resources/proto", "rm_protobuf_path" = "../shared-lib/**/protobuf" }
+env = { "rm_proto_path" = "./rust-lib/build-tool/**/resources/proto", "rm_protobuf_path" = "./rust-lib/build-tool/**/protobuf" }
 run_task = { name = "remove_files_with_pattern" }
 
 
 #Dart Clean
 [tasks.rm_dart_generated_files]
-env = { "dart_flowy_sdk_path" = "./app_flowy/packages/appflowy_backend/" }
+env = { "dart_flowy_sdk_path" = "./appflowy_flutter/packages/appflowy_backend/" }
 run_task = { name = [
   "rm_dart_generated_protobuf_files",
   "rm_dart_generated_event_files",
